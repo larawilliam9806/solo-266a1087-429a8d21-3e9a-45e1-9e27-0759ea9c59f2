@@ -16,10 +16,21 @@ from typing import Any, Optional
 
 from fastapi import FastAPI
 from fastapi.responses import JSONResponse
+from shapely.geometry import shape as shapely_shape
 
 from .db import connect, init_db
-from .geo import attribute_wells, parse_point, parse_polygon, validate_tiling
-from .schemas import InitRequest, ReplaceRequest
+from .geo import (
+    Rectangle,
+    attribute_locations,
+    bbox_to_geometry,
+    intersect_rectangles,
+    mapping_geometry,
+    parse_point,
+    parse_polygon,
+    parse_rectangle,
+    validate_tiling,
+)
+from .schemas import InitRequest, MeasurementRequest, ReplaceRequest
 
 
 @asynccontextmanager
@@ -80,9 +91,69 @@ def _load_attributions(conn: sqlite3.Connection, revision: int) -> dict[str, dic
     }
 
 
+def _load_measurements(conn: sqlite3.Connection, revision: int) -> dict[str, dict[str, Rectangle]]:
+    """读取某版本的测量快照：well_id -> measurement_id -> Rectangle。"""
+    rows = conn.execute(
+        "SELECT well_id, measurement_id, geojson FROM measurements "
+        "WHERE revision = ? ORDER BY well_id, measurement_id",
+        (revision,),
+    ).fetchall()
+    out: dict[str, dict[str, Rectangle]] = {}
+    for wid, mid, gj in rows:
+        geom = shapely_shape(json.loads(gj))
+        minx, miny, maxx, maxy = geom.bounds
+        out.setdefault(wid, {})[mid] = Rectangle(minx, miny, maxx, maxy)
+    return out
+
+
+def _possible_locations(well_geoms: dict[str, Any],
+                        measurements: dict[str, dict[str, Rectangle]]
+                        ) -> tuple[dict[str, Any], dict[str, dict]]:
+    """计算每口井在所查版本的可能位置几何与附加信息。
+
+    有有效测量的井取所有测量矩形的交集（点/线/面）；未复测的井沿用登记点。
+    测量交集在登记时已保证非空，这里做防御性断言。
+    返回 (well_id -> 几何, well_id -> {possible_position, measured, measurement_ids})。
+    """
+    locations: dict[str, Any] = {}
+    extra: dict[str, dict] = {}
+    for wid, pt in well_geoms.items():
+        rects = measurements.get(wid)
+        if not rects:
+            locations[wid] = pt
+            extra[wid] = {
+                "measured": False,
+                "measurement_ids": [],
+                "possible_position": mapping_geometry(pt),
+            }
+            continue
+        report = intersect_rectangles(rects)
+        if not report.ok:  # 存储层不变量：登记时空交集已被拒绝
+            raise RuntimeError(f"井 {wid} 的测量矩形交集为空，数据不变量被破坏")
+        geom = bbox_to_geometry(report.bbox)
+        locations[wid] = geom
+        extra[wid] = {
+            "measured": True,
+            "measurement_ids": sorted(rects),
+            "possible_position": mapping_geometry(geom),
+        }
+    return locations, extra
+
+
+def _measurements_to_snapshot(measurements: dict[str, dict[str, Rectangle]]
+                              ) -> dict[tuple[str, str], dict]:
+    """嵌套测量集合拍平成 (well_id, measurement_id) -> 矩形 GeoJSON。"""
+    snapshot: dict[tuple[str, str], dict] = {}
+    for wid, rects in measurements.items():
+        for mid, rect in rects.items():
+            snapshot[(wid, mid)] = rect.as_geojson()
+    return snapshot
+
+
 def _insert_version(conn: sqlite3.Connection, revision: int,
                     parcels: dict[str, dict], attributions: dict[str, dict],
-                    region: Optional[dict], wells: Optional[dict[str, dict]]) -> None:
+                    region: Optional[dict], wells: Optional[dict[str, dict]],
+                    measurements: Optional[dict[tuple[str, str], dict]] = None) -> None:
     """在已开启的事务内写入一个完整版本（不含 meta 指针）。"""
     if region is not None:
         conn.execute("INSERT INTO regions (id, geojson) VALUES (1, ?)",
@@ -108,6 +179,13 @@ def _insert_version(conn: sqlite3.Connection, revision: int,
         [(revision, wid, a["status"], a["parcel_id"], json.dumps(a["candidates"]))
          for wid, a in attributions.items()],
     )
+    if measurements is not None:
+        conn.executemany(
+            "INSERT INTO measurements (revision, well_id, measurement_id, geojson) "
+            "VALUES (?, ?, ?, ?)",
+            [(revision, wid, mid, json.dumps(g))
+             for (wid, mid), g in sorted(measurements.items())],
+        )
 
 
 def _validation_error(reasons: list[dict], *, gap_area: Optional[float] = None,
@@ -186,7 +264,8 @@ def initialize(req: InitRequest):
             overlap_parcel_ids=tiling.overlap_parcel_ids if tiling else None,
         )
 
-    attributions = attribute_wells(well_geoms, parcel_geoms)
+    # 首次提交尚无测量，可能位置即登记点
+    attributions = attribute_locations(well_geoms, parcel_geoms)
 
     conn = connect()
     try:
@@ -232,6 +311,7 @@ def replace_parcels(req: ReplaceRequest):
         region_gj = _load_region(conn)
         old_parcel_gj = _load_parcels(conn, current)
         well_gj = _load_well_geoms(conn)
+        base_measurements = _load_measurements(conn, current)
     finally:
         conn.close()
 
@@ -275,15 +355,18 @@ def replace_parcels(req: ReplaceRequest):
             overlap_parcel_ids=tiling.overlap_parcel_ids,
         )
 
-    # 4) 依新版边界重算全部井归属
+    # 4) 依新版边界重算全部井归属：沿用基准版测量，可能位置=测量矩形交集，
+    #    未复测的井继续用登记点
     well_geoms = {}
     for wid, gj in well_gj.items():
         geom, _ = parse_point(gj, well_id=wid, label=f"井 {wid}")
         well_geoms[wid] = geom
-    attributions = attribute_wells(well_geoms, new_geoms)
+    locations, _ = _possible_locations(well_geoms, base_measurements)
+    attributions = attribute_locations(locations, new_geoms)
 
     # 5) 乐观并发提交：同版并发修订只成功一份
     new_revision = current + 1
+    measurement_snapshot = _measurements_to_snapshot(base_measurements)
     conn = connect()
     try:
         conn.execute("BEGIN IMMEDIATE")
@@ -297,7 +380,8 @@ def replace_parcels(req: ReplaceRequest):
                     "base_revision": req.base_revision,
                 })
             _insert_version(conn, new_revision, new_parcel_gj, attributions,
-                            region=None, wells=None)
+                            region=None, wells=None,
+                            measurements=measurement_snapshot)
             cur = conn.execute(
                 "UPDATE meta SET current_revision = ? WHERE id = 1 AND current_revision = ?",
                 (new_revision, req.base_revision),
@@ -318,11 +402,170 @@ def replace_parcels(req: ReplaceRequest):
             "well_count": len(well_gj), "well_summary": _well_summary(attributions)}
 
 
+# ---------------------------------------------------------------- 测量登记
+
+@app.post("/v1/measurements")
+def register_measurements(req: MeasurementRequest):
+    """登记/订正测量并发布新版本：测量与重算的归属同版发布。
+
+    - 提交所见修订号、已登记井号、测量编号和轴对齐误差矩形；
+    - 同井同编号视为订正（UPSERT 覆盖）；
+    - 以该井所有有效矩形的交集为可能位置（线段/单点也有效），交集为空则
+      整体拒绝并返回一对互不相交的测量编号，原版保持不变；
+    - 同版并发提交只接受一份（与整批改图共用同一版本闸门）。
+    """
+    # 1) 读取 base 版本快照
+    conn = connect()
+    try:
+        current = _current_revision(conn)
+        if current is None:
+            return _err(404, {"error": "not_initialized",
+                              "message": "尚未首次提交，请先调用 POST /v1/init"})
+        if req.base_revision != current:
+            return _err(409, {
+                "error": "revision_conflict",
+                "message": f"所见修订号 {req.base_revision} 已过期，当前为 {current}，"
+                           "请重新读取后再提交",
+                "current_revision": current,
+                "base_revision": req.base_revision,
+            })
+        parcel_gj = _load_parcels(conn, current)
+        well_gj = _load_well_geoms(conn)
+        measurements = _load_measurements(conn, current)
+    finally:
+        conn.close()
+
+    # 2) 结构/语义校验：井号必须已登记、矩形有限且正面积、同井同编号去重
+    reasons: list[dict] = []
+    known_wells = set(well_gj)
+    seen: set[tuple[str, str]] = set()
+    incoming: list[tuple[str, str, Rectangle]] = []
+    for m in req.measurements:
+        key = (m.well_id, m.measurement_id)
+        if key in seen:
+            reasons.append({
+                "code": "duplicate_measurement_id",
+                "well_id": m.well_id, "measurement_id": m.measurement_id,
+                "message": f"井 {m.well_id} 的测量编号 {m.measurement_id} 在请求中重复",
+            })
+            continue
+        seen.add(key)
+        if m.well_id not in known_wells:
+            reasons.append({
+                "code": "unknown_well_id",
+                "well_id": m.well_id, "measurement_id": m.measurement_id,
+                "message": f"井 {m.well_id} 尚未登记，不能登记测量",
+            })
+            continue
+        rect, errs = parse_rectangle(
+            m.rectangle.model_dump(),
+            well_id=m.well_id, measurement_id=m.measurement_id)
+        reasons.extend(errs)
+        if rect is not None:
+            incoming.append((m.well_id, m.measurement_id, rect))
+    if reasons:
+        return _err(422, {"error": "validation_failed",
+                          "message": "测量登记未通过校验，当前版本保持不变",
+                          "reasons": reasons})
+
+    # 3) 应用 UPSERT 订正，逐井检查所有有效矩形的共同范围
+    updated = {wid: dict(rects) for wid, rects in measurements.items()}
+    for wid, mid, rect in incoming:
+        updated.setdefault(wid, {})[mid] = rect
+
+    for wid in sorted(updated):
+        report = intersect_rectangles(updated[wid])
+        if not report.ok:
+            a, b = report.disjoint_pair
+            return _err(422, {
+                "error": "empty_intersection",
+                "message": (f"井 {wid} 的测量矩形共同范围为空，登记被拒绝，"
+                            "当前版本保持不变"),
+                "well_id": wid,
+                "disjoint_measurement_ids": [a, b],
+                "reasons": [{
+                    "code": "empty_intersection",
+                    "well_id": wid,
+                    "measurement_ids": [a, b],
+                    "message": f"测量 {a} 与 {b} 的误差矩形互不相交，共同范围为空",
+                }],
+            })
+
+    # 4) 以新测量集合重算全部井归属（可能位置=矩形交集，未复测井用登记点）
+    parcel_geoms = {}
+    for pid, gj in parcel_gj.items():
+        geom, _ = parse_polygon(gj, parcel_id=pid, label=f"宗地 {pid}")
+        parcel_geoms[pid] = geom
+    well_geoms = {}
+    for wid, gj in well_gj.items():
+        geom, _ = parse_point(gj, well_id=wid, label=f"井 {wid}")
+        well_geoms[wid] = geom
+    locations, _ = _possible_locations(well_geoms, updated)
+    attributions = attribute_locations(locations, parcel_geoms)
+
+    # 5) 乐观并发提交：同版并发提交（含与整批改图竞争）只接受一份
+    new_revision = current + 1
+    snapshot = _measurements_to_snapshot(updated)
+    conn = connect()
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            if _current_revision(conn) != req.base_revision:
+                conn.execute("ROLLBACK")
+                return _err(409, {
+                    "error": "revision_conflict",
+                    "message": "提交期间已有其他修订发布，本次测量登记作废，请基于新版重试",
+                    "current_revision": _current_revision(conn),
+                    "base_revision": req.base_revision,
+                })
+            _insert_version(conn, new_revision, parcel_gj, attributions,
+                            region=None, wells=None, measurements=snapshot)
+            cur = conn.execute(
+                "UPDATE meta SET current_revision = ? WHERE id = 1 AND current_revision = ?",
+                (new_revision, req.base_revision),
+            )
+            if cur.rowcount != 1:
+                conn.execute("ROLLBACK")
+                return _err(409, {"error": "revision_conflict",
+                                  "message": "版本指针已被其他修订更新",
+                                  "base_revision": req.base_revision})
+            conn.execute("COMMIT")
+        except Exception:
+            conn.execute("ROLLBACK")
+            raise
+    finally:
+        conn.close()
+
+    return {
+        "revision": new_revision,
+        "registered": [{"well_id": wid, "measurement_id": mid}
+                       for wid, mid, _ in incoming],
+        "measurement_count": len(snapshot),
+        "well_count": len(well_gj),
+        "well_summary": _well_summary(attributions),
+    }
+
+
 # ---------------------------------------------------------------- 查询
 
-def _wells_payload(well_gj: dict[str, dict], attributions: dict[str, dict]) -> list[dict]:
+def _wells_payload(well_gj: dict[str, dict], attributions: dict[str, dict],
+                   measurements: dict[str, dict[str, Rectangle]]) -> list[dict]:
+    """组装井响应：保留登记点 geometry，并附所查版本的可能位置与归属。"""
+    well_geoms: dict[str, Any] = {}
+    for wid, gj in well_gj.items():
+        geom, _ = parse_point(gj, well_id=wid, label=f"井 {wid}")
+        well_geoms[wid] = geom
+    _, extra = _possible_locations(well_geoms, measurements)
     return [
-        {"id": wid, "geometry": well_gj[wid], **attributions[wid]}
+        {
+            "id": wid,
+            "geometry": well_gj[wid],                       # 登记点（不可变）
+            "registered_point": well_gj[wid],
+            "possible_position": extra[wid]["possible_position"],
+            "measured": extra[wid]["measured"],
+            "measurement_ids": extra[wid]["measurement_ids"],
+            **attributions[wid],
+        }
         for wid in sorted(well_gj)
     ]
 
@@ -343,6 +586,7 @@ def get_current():
             parcels = _load_parcels(conn, revision)
             well_gj = _load_well_geoms(conn)
             attributions = _load_attributions(conn, revision)
+            measurements = _load_measurements(conn, revision)
             conn.execute("COMMIT")
         except Exception:
             conn.execute("ROLLBACK")
@@ -354,7 +598,7 @@ def get_current():
         "revision": revision,
         "region": region,
         "parcels": [{"id": pid, "geometry": parcels[pid]} for pid in sorted(parcels)],
-        "wells": _wells_payload(well_gj, attributions),
+        "wells": _wells_payload(well_gj, attributions, measurements),
     }
 
 
@@ -383,9 +627,30 @@ def get_wells():
             return _err(404, {"error": "not_initialized", "message": "尚未首次提交"})
         well_gj = _load_well_geoms(conn)
         attributions = _load_attributions(conn, revision)
+        measurements = _load_measurements(conn, revision)
     finally:
         conn.close()
-    return {"revision": revision, "wells": _wells_payload(well_gj, attributions)}
+    return {"revision": revision,
+            "wells": _wells_payload(well_gj, attributions, measurements)}
+
+
+@app.get("/v1/measurements")
+def get_measurements():
+    """当前版本的测量快照（每口井各次测量的误差矩形）。"""
+    conn = connect()
+    try:
+        revision = _current_revision(conn)
+        if revision is None:
+            return _err(404, {"error": "not_initialized", "message": "尚未首次提交"})
+        measurements = _load_measurements(conn, revision)
+    finally:
+        conn.close()
+    items = [
+        {"well_id": wid, "measurement_id": mid, "rectangle": rect.as_geojson()}
+        for wid in sorted(measurements)
+        for mid, rect in sorted(measurements[wid].items())
+    ]
+    return {"revision": revision, "measurements": items}
 
 
 @app.get("/v1/revisions")
@@ -420,6 +685,7 @@ def get_revision(revision: int):
             parcels = _load_parcels(conn, revision)
             well_gj = _load_well_geoms(conn)
             attributions = _load_attributions(conn, revision)
+            measurements = _load_measurements(conn, revision)
             conn.execute("COMMIT")
         except Exception:
             conn.execute("ROLLBACK")
@@ -432,7 +698,7 @@ def get_revision(revision: int):
         "created_at": row[1],
         "region": region,
         "parcels": [{"id": pid, "geometry": parcels[pid]} for pid in sorted(parcels)],
-        "wells": _wells_payload(well_gj, attributions),
+        "wells": _wells_payload(well_gj, attributions, measurements),
     }
 
 

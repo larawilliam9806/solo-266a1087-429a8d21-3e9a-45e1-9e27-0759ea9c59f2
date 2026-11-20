@@ -56,6 +56,16 @@ CREATE TABLE IF NOT EXISTS well_attributions (
     candidates TEXT NOT NULL DEFAULT '[]',
     PRIMARY KEY (revision, well_id)
 );
+
+-- 测量按版本快照保存：登记/订正一次测量即随新版本整体发布，历史版本
+-- 保留当时的测量集合。同井同编号在同一版本内唯一（订正走 UPSERT 覆盖）。
+CREATE TABLE IF NOT EXISTS measurements (
+    revision       INTEGER NOT NULL REFERENCES versions(revision),
+    well_id        TEXT NOT NULL REFERENCES wells(well_id),
+    measurement_id TEXT NOT NULL,
+    geojson        TEXT NOT NULL,
+    PRIMARY KEY (revision, well_id, measurement_id)
+);
 """
 
 
@@ -92,6 +102,7 @@ def init_db() -> None:
             current = row[0]
             conn.execute("BEGIN")
             try:
+                conn.execute("DELETE FROM measurements WHERE revision > ?", (current,))
                 conn.execute("DELETE FROM well_attributions WHERE revision > ?", (current,))
                 conn.execute("DELETE FROM parcels WHERE revision > ?", (current,))
                 conn.execute("DELETE FROM versions WHERE revision > ?", (current,))

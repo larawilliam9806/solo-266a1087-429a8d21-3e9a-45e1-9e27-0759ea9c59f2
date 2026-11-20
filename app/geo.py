@@ -9,6 +9,14 @@
 
 容差说明：整数顶点多边形的面积是 0.5 的整数倍（鞋带公式），因此真实的
 空缺/重叠面积至少为 0.5，而浮点噪声远小于 1e-6，用 AREA_TOL 即可可靠区分。
+
+测量与可能位置：
+- 测量提交同一坐标系内的轴对齐误差矩形（bbox），坐标须有限、面积须为正。
+- 同井所有有效矩形的交集即"可能位置"（轴对齐，交集为线段/单点也有效）；
+  交集为空时整次登记拒绝。
+- 归属以可能位置判断：整个可能位置都严格位于唯一宗地内部才 assigned；
+  与宗地相交但无法确认唯一归属时 pending，candidates 列出所有相交宗地；
+  与所有宗地都不相交则 uncovered。未复测的井继续使用登记点。
 """
 from __future__ import annotations
 
@@ -16,7 +24,8 @@ import math
 from dataclasses import dataclass, field
 from typing import Any, Optional
 
-from shapely.geometry import Point, Polygon, shape
+from shapely.geometry import LineString, Point, Polygon, box, mapping, shape
+from shapely.geometry.base import BaseGeometry
 from shapely.ops import unary_union
 from shapely.validation import explain_validity
 
@@ -187,22 +196,144 @@ def validate_tiling(parcels: dict[str, Polygon], region: Polygon) -> TilingRepor
 
 def attribute_wells(wells: dict[str, Point],
                     parcels: dict[str, Polygon]) -> dict[str, dict]:
-    """按新边界重算全部井归属。
+    """按新边界重算全部井归属（登记点口径）。
 
     - 严格位于唯一宗地内部 → assigned
     - 落在宗地边界上（共边/共点）→ pending，candidates 列出所有候选宗地
     - 不沾任何宗地（含区域外）→ uncovered
     """
+    return attribute_locations(wells, parcels)
+
+
+# ---------------------------------------------------------------- 测量矩形
+
+@dataclass
+class Rectangle:
+    """同一坐标系内的轴对齐误差矩形。"""
+    minx: float
+    miny: float
+    maxx: float
+    maxy: float
+
+    def to_shapely(self) -> Polygon:
+        return box(self.minx, self.miny, self.maxx, self.maxy)
+
+    def as_geojson(self) -> dict:
+        return mapping_geometry(self.to_shapely())
+
+
+def parse_rectangle(rect: Any, *, well_id: Optional[str] = None,
+                    measurement_id: Optional[str] = None) -> tuple[Optional[Rectangle], list[dict]]:
+    """解析轴对齐误差矩形：四个坐标有限，且 max > min（面积为正）。"""
+    errors: list[dict] = []
+    tag: dict[str, Any] = {}
+    if well_id is not None:
+        tag["well_id"] = well_id
+    if measurement_id is not None:
+        tag["measurement_id"] = measurement_id
+    label = f"井 {well_id} 测量 {measurement_id}" if well_id is not None else "测量"
+
+    def fail(code: str, message: str) -> None:
+        errors.append(_err(code, message, **tag))
+
+    if not isinstance(rect, dict):
+        fail("invalid_rectangle", f"{label}：rectangle 必须是包含 minx/miny/maxx/maxy 的对象")
+        return None, errors
+    keys = ("minx", "miny", "maxx", "maxy")
+    vals = []
+    for k in keys:
+        v = rect.get(k)
+        if not _is_finite_number(v):
+            fail("invalid_rectangle", f"{label}：{k} 必须是有限数值")
+        else:
+            vals.append(float(v))
+    if errors:
+        return None, errors
+    minx, miny, maxx, maxy = vals
+    if maxx <= minx or maxy <= miny:
+        fail("invalid_rectangle",
+             f"{label}：矩形面积须为正，需要 maxx > minx 且 maxy > miny，"
+             f"得到 ({minx}, {miny}) - ({maxx}, {maxy})")
+        return None, errors
+    return Rectangle(minx, miny, maxx, maxy), errors
+
+
+@dataclass
+class IntersectionReport:
+    """同井一组矩形求交的结果。"""
+    ok: bool
+    bbox: Optional[tuple[float, float, float, float]] = None  # (minx, miny, maxx, maxy)
+    disjoint_pair: Optional[tuple[str, str]] = None          # 交集为空时的一对互不相交编号
+
+
+def intersect_rectangles(rects: dict[str, Rectangle]) -> IntersectionReport:
+    """计算同一口井所有有效矩形的共同范围（轴对齐 bbox 交集）。
+
+    交集为点或线段同样有效（bbox 有零宽边但不报错）；交集为空时返回一对
+    互不相交的测量编号。
+    """
+    if not rects:
+        return IntersectionReport(ok=False)
+    ids = sorted(rects)
+    minx = max(rects[i].minx for i in ids)
+    miny = max(rects[i].miny for i in ids)
+    maxx = min(rects[i].maxx for i in ids)
+    maxy = min(rects[i].maxy for i in ids)
+    if minx <= maxx and miny <= maxy:
+        return IntersectionReport(ok=True, bbox=(minx, miny, maxx, maxy))
+
+    # 交集为空：至少一个轴向上区间不相交，找出一对互不相交的测量。
+    # x 轴上取下界最大者与上界最小者，二者在 x 方向必然不重叠。
+    lo = max(ids, key=lambda i: (rects[i].minx, i))
+    hi = min(ids, key=lambda i: (rects[i].maxx, i))
+    if rects[lo].minx > rects[hi].maxx:
+        pair = (lo, hi)
+    else:
+        lo = max(ids, key=lambda i: (rects[i].miny, i))
+        hi = min(ids, key=lambda i: (rects[i].maxy, i))
+        # y 轴必不相交，否则与 bbox 交集为空矛盾
+        pair = (lo, hi)
+    a, b = sorted(pair)
+    return IntersectionReport(ok=False, disjoint_pair=(a, b))
+
+
+def bbox_to_geometry(bbox: tuple[float, float, float, float]) -> BaseGeometry:
+    """把 bbox 转成 Shapely 几何：退化为线段/单点时给出对应有效几何。"""
+    minx, miny, maxx, maxy = bbox
+    if minx == maxx and miny == maxy:
+        return Point(minx, miny)
+    if minx == maxx or miny == maxy:
+        return LineString([(minx, miny), (maxx, maxy)])
+    return box(minx, miny, maxx, maxy)
+
+
+def mapping_geometry(geom: BaseGeometry) -> dict:
+    return mapping(geom)
+
+
+# ---------------------------------------------------------------- 可能位置归属
+
+def attribute_locations(locations: dict[str, BaseGeometry],
+                        parcels: dict[str, Polygon]) -> dict[str, dict]:
+    """按"可能位置"几何计算每口井的归属。
+
+    位置可以是 Point（未复测井/单点交集）、LineString（线段交集）或
+    Polygon（面交集）：
+    - 整个位置严格位于唯一宗地内部（parcel.contains(location)）→ assigned；
+    - 否则与至少一块宗地相交（含只碰到边界、跨边界）→ pending，
+      candidates 列出所有相交宗地；
+    - 与所有宗地都不相交 → uncovered。
+    """
     items = sorted(parcels.items())
     result: dict[str, dict] = {}
-    for wid in sorted(wells):
-        pt = wells[wid]
-        containing = [pid for pid, geom in items if geom.contains(pt)]
+    for wid in sorted(locations):
+        loc = locations[wid]
+        containing = [pid for pid, geom in items if geom.contains(loc)]
         if len(containing) == 1:
             result[wid] = {"status": "assigned", "parcel_id": containing[0],
                            "candidates": containing}
             continue
-        touching = [pid for pid, geom in items if geom.intersects(pt)]
+        touching = [pid for pid, geom in items if geom.intersects(loc)]
         if touching:
             result[wid] = {"status": "pending", "parcel_id": None,
                            "candidates": touching}
